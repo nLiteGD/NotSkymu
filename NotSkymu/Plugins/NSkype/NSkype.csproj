@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<!--
+			Plain netstandard2.0 again, with none of the earlier RID/TFM
+			workarounds — those existed purely to fight SIPSorcery/
+			SIPSorceryMedia.Windows compatibility issues (see git history /
+			earlier README revisions if curious). Calling is no longer real
+			WebRTC: audio is relayed through your own server over a plain
+			WebSocket instead of negotiated peer-to-peer via SDP/ICE/DTLS-SRTP.
+			Since you own both client and server, WebRTC's actual reason to
+			exist — two strangers behind unknown NATs finding each other
+			without a server in the middle — doesn't apply here, and dropping
+			it also drops every dependency that caused trouble: no more
+			SIPSorcery, DnsClient, or Microsoft.Win32.Registry in this project
+			at all. See NSkype/README.md.
+		-->
+		<TargetFramework>netstandard2.0</TargetFramework>
+		<AssemblyName>smp.nskype</AssemblyName>
+		<AssemblyTitle>NSkype</AssemblyTitle>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+		<FileVersion>0.1.0.0</FileVersion>
+		<PlatformTarget>AnyCPU</PlatformTarget>
+		<OutputPath>..\bin\nskype.smp</OutputPath>
+		<LangVersion>8.0</LangVersion>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="System.Text.Json" Version="10.0.5" />
+		<!-- Real mic/speaker device I/O — same package Discord/Fluxer already use successfully from netstandard2.0. -->
+		<PackageReference Include="NAudio.WinMM" Version="2.3.0" />
+		<PackageReference Include="SIPSorcery" Version="6.0.4" />
+		<!--
+			Standard, first-party Microsoft compatibility package providing
+			System.Net.WebSockets.ClientWebSocket to netstandard2.0 projects
+			(resolves to each host's native implementation at runtime — net461's
+			own built-in ClientWebSocket, or net5.0-windows's). Long-stable,
+			first-party, not the kind of package that tends to have the
+			version/TFM churn we hit with SIPSorceryMedia.Windows.
+		-->
+		<PackageReference Include="System.Net.WebSockets.Client" Version="4.3.2" />
+	</ItemGroup>
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<DebugType>none</DebugType>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\..\Yggdrasil\Yggdrasil.csproj" />
+	</ItemGroup>
+</Project>
