@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<!--
+			Plain netstandard2.0. Calling uses real WebRTC (SIPSorcery) with
+			genuine SDP offer/answer negotiated through server.js's actual
+			call-signaling endpoints - required for interop with real
+			Skype-family clients, which only understand SDP-based negotiation.
+			An earlier revision's comment here claimed SIPSorcery had been
+			dropped in favor of a custom WebSocket relay; that relay never
+			had a real server-side counterpart (see Core.cs's header comment)
+			and this project reference was never actually removed. See
+			NSkype/README.md.
+		-->
+		<TargetFramework>netstandard2.0</TargetFramework>
+		<AssemblyName>smp.nskype</AssemblyName>
+		<AssemblyTitle>NSkype</AssemblyTitle>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+		<FileVersion>0.1.0.0</FileVersion>
+		<PlatformTarget>AnyCPU</PlatformTarget>
+		<OutputPath>..\bin\nskype.smp</OutputPath>
+		<LangVersion>8.0</LangVersion>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="System.Text.Json" Version="10.0.5" />
+		<!-- Real mic/speaker device I/O — same package Discord/Fluxer already use successfully from netstandard2.0. -->
+		<PackageReference Include="NAudio.WinMM" Version="2.3.0" />
+		<PackageReference Include="SIPSorcery" Version="6.0.4" />
+		<!--
+			Standard, first-party Microsoft compatibility package providing
+			System.Net.WebSockets.ClientWebSocket to netstandard2.0 projects
+			(resolves to each host's native implementation at runtime — net461's
+			own built-in ClientWebSocket, or net5.0-windows's). Long-stable,
+			first-party, not the kind of package that tends to have the
+			version/TFM churn we hit with SIPSorceryMedia.Windows.
+		-->
+		<PackageReference Include="System.Net.WebSockets.Client" Version="4.3.2" />
+	</ItemGroup>
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<DebugType>none</DebugType>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\..\Yggdrasil\Yggdrasil.csproj" />
+	</ItemGroup>
+</Project>
