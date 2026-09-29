@@ -1,18 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
 		<!--
-			Plain netstandard2.0 again, with none of the earlier RID/TFM
-			workarounds — those existed purely to fight SIPSorcery/
-			SIPSorceryMedia.Windows compatibility issues (see git history /
-			earlier README revisions if curious). Calling is no longer real
-			WebRTC: audio is relayed through your own server over a plain
-			WebSocket instead of negotiated peer-to-peer via SDP/ICE/DTLS-SRTP.
-			Since you own both client and server, WebRTC's actual reason to
-			exist — two strangers behind unknown NATs finding each other
-			without a server in the middle — doesn't apply here, and dropping
-			it also drops every dependency that caused trouble: no more
-			SIPSorcery, DnsClient, or Microsoft.Win32.Registry in this project
-			at all. See NSkype/README.md.
+			Plain netstandard2.0. Calling uses real WebRTC (SIPSorcery) with
+			genuine SDP offer/answer negotiated through server.js's actual
+			call-signaling endpoints - required for interop with real
+			Skype-family clients, which only understand SDP-based negotiation.
+			An earlier revision's comment here claimed SIPSorcery had been
+			dropped in favor of a custom WebSocket relay; that relay never
+			had a real server-side counterpart (see Core.cs's header comment)
+			and this project reference was never actually removed. See
+			NSkype/README.md.
 		-->
 		<TargetFramework>netstandard2.0</TargetFramework>
 		<AssemblyName>smp.nskype</AssemblyName>

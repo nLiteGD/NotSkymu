@@ -1070,7 +1070,25 @@ namespace Skymu
         private static void OnAnyPropertyChanged(
             DependencyObject d,
             DependencyPropertyChangedEventArgs e
-        ) => ((SliceControl)d).UpdateSlices();
+        )
+        {
+            if (e.Property == DefaultIndexProperty)
+            {
+                var control = (SliceControl)d;
+                // Name isn't unique - every instance generated from the same
+                // shared DataTemplate has the identical x:Name, so filtering
+                // by Name can't tell one contact's icon apart from another's
+                // (or from unrelated animated elements reusing the same
+                // name). DataContext is what's actually unique per instance.
+                if (control.DataContext is Yggdrasil.Models.DirectMessage dm)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[SliceControl] DefaultIndex changed for contact '{dm.Partner?.Username}' (Identifier={dm.Identifier}): {e.OldValue} -> {e.NewValue}"
+                    );
+                }
+            }
+            ((SliceControl)d).UpdateSlices();
+        }
 
         private static void OnOffsetChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
@@ -1184,7 +1202,13 @@ namespace Skymu
         {
             var bmp = Source as BitmapSource;
             if (bmp == null)
+            {
+                if (DataContext is Yggdrasil.Models.DirectMessage dm)
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[SliceControl] UpdateSlices for contact '{dm.Partner?.Username}': Source is null - bailing, nothing will render"
+                    );
                 return;
+            }
 
             if (_middleBrush == null)
                 _middleBrush = MakeBrush();

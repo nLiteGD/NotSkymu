@@ -2,21 +2,31 @@
 // Talks to a plain HTTP/JSON backend (your Server/server.js) — no Microsoft
 // code, no Skype client binaries involved. Implements ICore fully,
 // IListManagement for contact search/add, and ICall with real two-way audio
-// calling via your server's own WebSocket audio relay (Server/server.js's
-// audioRelayServer / handleCallAudioUpgrade) + NAudio for mic/speaker
-// device access — no WebRTC, no SDP/ICE/DTLS-SRTP, no SIPSorcery dependency
-// at all. See the "Why not WebRTC" section in README.md for why an earlier
-// SIPSorcery-based attempt was abandoned in favor of this. Video calling is
-// NOT implemented — StartCall always negotiates audio-only regardless of
-// is_video_call, and SetVideoEnabled is a no-op.
+// via genuine WebRTC (SIPSorcery) — real SDP offer/answer negotiated through
+// server.js's actual call-signaling endpoints (callInvitation/callAcceptance
+// mediaContent for the initial exchange; mediaNegotiation/mediaAnswer/
+// mediaAcknowledgement exist server-side for renegotiation but aren't needed
+// for a basic audio call and aren't used here). This is required, not
+// optional, for interop with real Skype-family clients on the other end —
+// they only understand SDP-based negotiation. An earlier revision of this
+// file used a custom WebSocket "audio relay" instead; that mechanism never
+// existed server-side (no handleCallAudioUpgrade or equivalent anywhere in
+// server.js) and calls against a real client would ring, then get torn down
+// during that client's own media-answer timeout, matching exactly what was
+// reported. Video calling is NOT implemented — StartCall always negotiates
+// audio-only regardless of is_video_call, and SetVideoEnabled is a no-op.
 //
-// IMPORTANT: I could not compile or run this against NAudio/ClientWebSocket
-// in the sandbox I wrote it in (no NuGet/.NET toolchain access there) — the
-// relay protocol itself is grounded directly in your server's real
-// handleCallAudioUpgrade implementation, not guessed, but the client-side
-// wiring is still an untested first draft. That said, this is far simpler
-// than the WebRTC attempt (no SDP, no ICE, no third-party media library),
-// so there's a lot less surface area for something to go wrong.
+// IMPORTANT: I could not compile or run this against SIPSorcery/NAudio in
+// the sandbox I wrote it in (no .NET toolchain or NuGet access there). Every
+// request/response shape (callInvitation.mediaContent, callAcceptance.
+// mediaContent, the callNotification/callAcceptance event payloads) is
+// verified directly against server.js's actual route handlers, not guessed.
+// The SIPSorcery API calls (createOffer/setLocalDescription/
+// setRemoteDescription/SendAudio, RTCSessionDescriptionInit, SetDescription
+// ResultEnum) are written to SIPSorcery 6.0.4's public API to the best of
+// available knowledge, but exact method signatures can drift slightly
+// between versions — if something doesn't compile, that's most likely
+// where to look first.
 
 using System;
 using System.Collections.Generic;
@@ -84,20 +94,13 @@ namespace NSkype
         // have to re-fetch profiles constantly.
         private readonly Dictionary<string, User> _userCache = new Dictionary<string, User>();
 
-        // Calling state — only one call at a time is supported. Uses your
-        // server's existing WebSocket audio relay (Server/server.js's
-        // audioRelayServer / handleCallAudioUpgrade) instead of WebRTC — no
-        // SDP/ICE/DTLS-SRTP, no SIPSorcery dependency, no TFM/DNS headaches.
-        // See the "Why not WebRTC" section in README.md for why this
-        // replaced the earlier SIPSorcery-based attempt.
-        private System.Net.WebSockets.ClientWebSocket _audioSocket;
-        private CancellationTokenSource _audioCts;
-        // Populated from the server's own response (see ParseAudioRelay) rather
-        // than guessed — config.json's audioRelayPort defaults to mainPort+1
-        // but can be overridden, so trust what the server actually reports.
-        private string _relayHost;
-        private int _relayPort;
-        private readonly SemaphoreSlim _audioSendLock = new SemaphoreSlim(1, 1);
+        // Calling state — only one call at a time is supported. Real WebRTC via
+        // SIPSorcery: server.js implements genuine SDP negotiation
+        // (mediaNegotiation/mediaAnswer/mediaAcknowledgement, plus offer/answer
+        // bundled into call-create/accept), which is what real Skype-family
+        // clients on the other end require. There is no audio-relay
+        // WebSocket anywhere in server.js - that was never real; see the
+        // handleCallAudioUpgrade fix for how this was diagnosed.
         private NAudio.Wave.WaveInEvent _waveIn;
         private NAudio.Wave.WaveOutEvent _waveOut;
         private NAudio.Wave.BufferedWaveProvider _playbackBuffer;
@@ -323,8 +326,15 @@ namespace NSkype
                 var displayName = c.TryGetProperty("display_name", out var dn) ? dn.GetString() : mri;
                 var mood = c.TryGetProperty("profile", out var profile) && profile.TryGetProperty("mood", out var moodEl)
                     ? moodEl.GetString() : null;
-                var user = new User(displayName, StripMriPrefix(mri), mri, mood, PresenceStatus.Offline);
-                _userCache[mri] = user;
+                // Reuse the cached instance if there is one. Replacing it here
+                // left Recents (built from FetchConversations) holding the old
+                // User while presence updates mutated this new one, so Recents
+                // never saw status changes.
+                if (!_userCache.TryGetValue(mri, out var user))
+                {
+                    user = new User(displayName, StripMriPrefix(mri), mri, mood, PresenceStatus.Offline);
+                    _userCache[mri] = user;
+                }
                 result.Add(new DirectMessage(user, 0, mri));
             }
             return result;
@@ -641,106 +651,213 @@ namespace NSkype
         {
             if (!evt.TryGetProperty("resourceType", out var typeEl)) return;
             var type = typeEl.GetString();
+            System.Diagnostics.Debug.WriteLine($"[NSkype] HandleEvent: resourceType={type}");
             if (!evt.TryGetProperty("resource", out var resource)) return;
 
             switch (type)
             {
                 case "NewMessage":
-                {
-                    if (!resource.TryGetProperty("messagetype", out var mt)) return;
-                    var mtStr = mt.GetString();
-                    if (mtStr == "Control/Typing" || mtStr == "Control/ClearTyping" || mtStr == "Signal/Call")
                     {
-                        // Signal/Call is a legacy-style call notification kept for
-                        // compatibility with older clients — we use the cleaner
-                        // CallNotification/CallAcceptance/CallEnd events below instead,
-                        // so just skip it here rather than showing it as a chat message.
-                        return;
+                        if (!resource.TryGetProperty("messagetype", out var mt)) return;
+                        var mtStr = mt.GetString();
+                        if (mtStr == "Control/Typing" || mtStr == "Control/ClearTyping" || mtStr == "Signal/Call")
+                        {
+                            // Signal/Call is a legacy-style call notification kept for
+                            // compatibility with older clients — we use the cleaner
+                            // CallNotification/CallAcceptance/CallEnd events below instead,
+                            // so just skip it here rather than showing it as a chat message.
+                            return;
+                        }
+                        var convId = resource.TryGetProperty("conversationLink", out var cl)
+                            ? cl.GetString()?.Split('/').LastOrDefault()
+                            : null;
+                        var msg = await MessageFromJson(resource);
+                        MessageTube?.Invoke(this, new MessageRecievedBottle(convId ?? msg.Identifier, msg, false));
+                        break;
                     }
-                    var convId = resource.TryGetProperty("conversationLink", out var cl)
-                        ? cl.GetString()?.Split('/').LastOrDefault()
-                        : null;
-                    var msg = await MessageFromJson(resource);
-                    MessageTube?.Invoke(this, new MessageRecievedBottle(convId ?? msg.Identifier, msg, false));
-                    break;
-                }
                 case "UserPresence":
-                {
-                    if (resource.TryGetProperty("selfLink", out _)) { /* self presence echo, ignore */ }
-                    break;
-                }
-                case "ConversationUpdate":
-                {
-                    if (resource.TryGetProperty("id", out var idEl))
                     {
-                        var id = idEl.GetString();
-                        var user = _userCache.TryGetValue(id, out var cached) ? cached : new User(id, StripMriPrefix(id), id);
-                        ListTube?.Invoke(this, new ListItemUpdatedBottle(ListType.Conversations, new DirectMessage(user, 0, id)));
+                        // selfLink is present on every presence document, ours and
+                        // every contact's alike (see userPresenceResource in
+                        // server.js) - its mere presence was never a valid way to
+                        // detect a self-echo, which is why this unconditionally
+                        // did nothing before regardless of whose presence this
+                        // actually was. What DOES tell us whose presence this is,
+                        // is the mri embedded in selfLink's own URL:
+                        // .../v1/users/{mri}/presenceDocs/messagingService.
+                        System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence raw resource: {resource.GetRawText()}");
+                        if (!resource.TryGetProperty("selfLink", out var selfLinkEl))
+                        {
+                            System.Diagnostics.Debug.WriteLine("[NSkype] UserPresence: no selfLink property found, bailing");
+                            return;
+                        }
+                        var mriMatch = System.Text.RegularExpressions.Regex.Match(
+                            selfLinkEl.GetString() ?? "", @"/v1/users/([^/]+)/presenceDocs/");
+                        if (!mriMatch.Success)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence: selfLink didn't match expected shape: {selfLinkEl.GetString()}");
+                            return;
+                        }
+                        var presenceMri = Uri.UnescapeDataString(mriMatch.Groups[1].Value);
+                        var presenceUsername = StripMriPrefix(presenceMri);
+                        System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence: parsed mri={presenceMri} username={presenceUsername} (our own username={_username})");
+
+                        if (string.Equals(presenceUsername, _username, StringComparison.OrdinalIgnoreCase))
+                        {
+                            System.Diagnostics.Debug.WriteLine("[NSkype] UserPresence: this is our own presence echoing back, skipping");
+                            return; // genuinely our own presence echoing back - nothing to update
+                        }
+
+                        if (!resource.TryGetProperty("availability", out var availEl)
+                            && !resource.TryGetProperty("status", out availEl))
+                        {
+                            System.Diagnostics.Debug.WriteLine("[NSkype] UserPresence: no availability/status property found, bailing");
+                            return;
+                        }
+                        var rawStatus = availEl.GetString();
+                        var newStatus = rawStatus switch
+                        {
+                            "Online" => PresenceStatus.Online,
+                            "Away" => PresenceStatus.Away,
+                            "DoNotDisturb" => PresenceStatus.DoNotDisturb,
+                            "Hidden" => PresenceStatus.Invisible,
+                            "Offline" => PresenceStatus.Offline,
+                            _ => PresenceStatus.Offline
+                        };
+                        System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence: rawStatus='{rawStatus}' -> mapped to {newStatus}");
+
+                        // _userCache is keyed by full mri for contacts (see
+                        // GetContacts) - matching that convention here so this
+                        // actually finds/updates the same cached instance the
+                        // contacts list is already showing, rather than creating
+                        // a disconnected duplicate.
+                        bool foundExisting = _userCache.TryGetValue(presenceMri, out var contactUser);
+                        System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence: existing cached User found for {presenceMri}? {foundExisting}. contactUser.ConnectionStatus before update: {contactUser?.ConnectionStatus}");
+
+                        // server.js resends presence for every contact on every
+                        // poll cycle, not just on real changes - without this
+                        // guard we fired a UI update (and, via
+                        // CompactRecentsRefreshRequested, a full Recents
+                        // ItemsSource rebuild) on every poll for every contact
+                        // regardless of whether anything changed. That constant
+                        // rebuild tore down Recents' containers faster than the
+                        // async status-icon image (Source) could ever finish
+                        // loading - see SliceControl.UpdateSlices, which bails
+                        // whenever Source is null. Only notify on a real change.
+                        bool statusActuallyChanged = !foundExisting || contactUser.ConnectionStatus != newStatus;
+
+                        if (!foundExisting)
+                        {
+                            contactUser = new User(presenceUsername, presenceUsername, presenceMri, null, newStatus);
+                            _userCache[presenceMri] = contactUser;
+                        }
+                        contactUser.ConnectionStatus = newStatus;
+
+                        if (!statusActuallyChanged)
+                        {
+                            System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence: status for {presenceMri} unchanged ({newStatus}), skipping UI notification");
+                            break;
+                        }
+
+                        System.Diagnostics.Debug.WriteLine($"[NSkype] UserPresence: set contactUser.ConnectionStatus={contactUser.ConnectionStatus} for {presenceMri}, ListTube subscribed? {ListTube != null}");
+
+                        ListTube?.Invoke(this, new ListItemUpdatedBottle(ListType.Contacts, new DirectMessage(contactUser, 0, presenceMri)));
+                        break;
                     }
-                    break;
-                }
+                case "ConversationUpdate":
+                    {
+                        if (resource.TryGetProperty("id", out var idEl))
+                        {
+                            var id = idEl.GetString();
+                            var user = _userCache.TryGetValue(id, out var cached) ? cached : new User(id, StripMriPrefix(id), id);
+                            ListTube?.Invoke(this, new ListItemUpdatedBottle(ListType.Conversations, new DirectMessage(user, 0, id)));
+                        }
+                        break;
+                    }
                 case "CallNotification":
-                {
-                    // Someone is calling us. Cache the call id so AnswerCall can
-                    // pick it up when the user accepts. No SDP to extract or
-                    // cache — the audio relay doesn't need it.
-                    var convId = resource.TryGetProperty("conversationLink", out var cl2)
-                        ? cl2.GetString()?.Split('/').LastOrDefault()
-                        : null;
-                    string callId = null;
-                    if (resource.TryGetProperty("conversationInvitation", out var invitation)
-                        && invitation.TryGetProperty("conversationController", out var controllerEl))
-                        callId = ExtractCallId(controllerEl.GetString());
+                    {
+                        // Someone is calling us. Cache the call id so AnswerCall
+                        // can pick it up when the user accepts - and cache the
+                        // caller's SDP offer too, from callNotification.mediaContent
+                        // (see server.js's callIncomingPayload), since AnswerCall
+                        // needs it to build a real answer.
+                        var convId = resource.TryGetProperty("conversationLink", out var cl2)
+                            ? cl2.GetString()?.Split('/').LastOrDefault()
+                            : null;
+                        string callId = null;
+                        if (resource.TryGetProperty("conversationInvitation", out var invitation)
+                            && invitation.TryGetProperty("conversationController", out var controllerEl))
+                            callId = ExtractCallId(controllerEl.GetString());
 
-                    if (callId == null || convId == null) return;
+                        if (callId == null || convId == null) return;
 
-                    _pendingIncomingCallId = callId;
-                    _pendingIncomingConvoId = convId;
+                        _pendingIncomingCallId = callId;
+                        _pendingIncomingConvoId = convId;
+                        _pendingIncomingOffer = null;
+                        if (resource.TryGetProperty("callNotification", out var callNotif)
+                            && callNotif.TryGetProperty("mediaContent", out var offerContent)
+                            && offerContent.TryGetProperty("blob", out var offerBlob))
+                            _pendingIncomingOffer = offerBlob.GetString();
 
-                    // CallBottle.Caller must be a real Conversation (IncomingCall's
-                    // XAML reads Caller.Avatar / Caller.DisplayName directly) — the
-                    // (string, CallState) constructor leaves Caller null, which is
-                    // exactly what was crashing IncomingCall's constructor.
-                    var callerUser = _userCache.TryGetValue(convId, out var cachedCaller)
-                        ? cachedCaller
-                        : new User(StripMriPrefix(convId), StripMriPrefix(convId), convId);
-                    var callerConvo = new DirectMessage(callerUser, 0, convId);
-                    IncomingCallTube?.Invoke(this, new CallBottle(callerConvo, CallState.Ringing));
-                    break;
-                }
+                        // CallBottle.Caller must be a real Conversation (IncomingCall's
+                        // XAML reads Caller.Avatar / Caller.DisplayName directly) — the
+                        // (string, CallState) constructor leaves Caller null, which is
+                        // exactly what was crashing IncomingCall's constructor.
+                        var callerUser = _userCache.TryGetValue(convId, out var cachedCaller)
+                            ? cachedCaller
+                            : new User(StripMriPrefix(convId), StripMriPrefix(convId), convId);
+                        var callerConvo = new DirectMessage(callerUser, 0, convId);
+                        IncomingCallTube?.Invoke(this, new CallBottle(callerConvo, CallState.Ringing));
+                        break;
+                    }
                 case "CallAcceptance":
-                {
-                    // The person we called just accepted. No SDP answer to apply —
-                    // just connect our end of the audio relay and start talking.
-                    if (_activeCall == null) return;
-                    _activeCall.State = CallState.Active;
-                    await ConnectAudioSocket(_activeCall.CallId);
-                    CallStateChangedTube?.Invoke(this, new CallBottle(_activeCall.ConversationId, CallState.Active));
-                    break;
-                }
+                    {
+                        // The person we called just accepted - apply their SDP
+                        // answer from callAcceptance.mediaContent (see server.js's
+                        // callAcceptancePayload) to actually complete the
+                        // offer/answer exchange. We don't flip to CallState.Active
+                        // here ourselves - CreatePeerConnectionAsync's
+                        // onconnectionstatechange handler does that once ICE/DTLS
+                        // genuinely finish, which is what actually starting
+                        // "talking" depends on, not just receiving this event.
+                        if (_activeCall == null || _peerConnection == null) return;
+                        if (resource.TryGetProperty("callAcceptance", out var acceptance)
+                            && acceptance.TryGetProperty("mediaContent", out var answerContent)
+                            && answerContent.TryGetProperty("blob", out var answerBlob))
+                        {
+                            var answerSdp = answerBlob.GetString();
+                            if (!string.IsNullOrEmpty(answerSdp))
+                            {
+                                var result = _peerConnection.setRemoteDescription(new RTCSessionDescriptionInit { type = RTCSdpType.answer, sdp = answerSdp });
+                                if (result != SetDescriptionResultEnum.OK)
+                                    DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, $"Couldn't apply the call's answer: {result}"));
+                            }
+                        }
+                        break;
+                    }
                 case "CallEnd":
-                {
-                    // The server queues a CallEnd for both parties whenever any
-                    // call ends, and our own poll loop can pick up a *stale* one
-                    // left over from an earlier test call if it wasn't fully
-                    // drained — reacting to it unconditionally was ending brand
-                    // new calls the instant a leftover event got delivered.
-                    // Only react if this actually matches the call we're
-                    // currently tracking.
-                    var endedCallId = resource.TryGetProperty("url", out var endUrlEl) ? ExtractCallEndId(endUrlEl.GetString()) : null;
-                    var currentCallId = _activeCall?.CallId ?? _pendingIncomingCallId;
-                    if (endedCallId != null && currentCallId != null && endedCallId != currentCallId)
-                        break; // stale event for a different/older call — ignore it
+                    {
+                        // The server queues a CallEnd for both parties whenever any
+                        // call ends, and our own poll loop can pick up a *stale* one
+                        // left over from an earlier test call if it wasn't fully
+                        // drained — reacting to it unconditionally was ending brand
+                        // new calls the instant a leftover event got delivered.
+                        // Only react if this actually matches the call we're
+                        // currently tracking.
+                        var endedCallId = resource.TryGetProperty("url", out var endUrlEl) ? ExtractCallEndId(endUrlEl.GetString()) : null;
+                        var currentCallId = _activeCall?.CallId ?? _pendingIncomingCallId;
+                        if (endedCallId != null && currentCallId != null && endedCallId != currentCallId)
+                            break; // stale event for a different/older call — ignore it
 
-                    var convId = resource.TryGetProperty("conversationLink", out var cl3)
-                        ? cl3.GetString()?.Split('/').LastOrDefault()
-                        : null;
-                    CleanupCall();
-                    _pendingIncomingCallId = null;
-                    _pendingIncomingConvoId = null;
-                    CallStateChangedTube?.Invoke(this, new CallBottle(convId, CallState.Ended));
-                    break;
-                }
+                        var convId = resource.TryGetProperty("conversationLink", out var cl3)
+                            ? cl3.GetString()?.Split('/').LastOrDefault()
+                            : null;
+                        CleanupCall();
+                        _pendingIncomingCallId = null;
+                        _pendingIncomingConvoId = null;
+                        CallStateChangedTube?.Invoke(this, new CallBottle(convId, CallState.Ended));
+                        break;
+                    }
             }
         }
 
@@ -852,6 +969,26 @@ namespace NSkype
             return pcm;
         }
 
+        // Standard G.711 mu-law encoder — mirrors DecodeMuLaw below it.
+        private static byte[] EncodeMuLaw(byte[] pcm16)
+        {
+            const int bias = 0x84, clip = 32635;
+            var encoded = new byte[pcm16.Length / 2];
+            for (int i = 0, o = 0; i < pcm16.Length - 1; i += 2, o++)
+            {
+                int sample = (short)((pcm16[i + 1] << 8) | pcm16[i]);
+                int sign = (sample >> 8) & 0x80;
+                if (sign != 0) sample = -sample;
+                if (sample > clip) sample = clip;
+                sample += bias;
+                int exponent = 7;
+                for (int mask = 0x4000; (sample & mask) == 0 && exponent > 0; mask >>= 1) exponent--;
+                int mantissa = (sample >> (exponent + 3)) & 0x0f;
+                encoded[o] = (byte)~(sign | (exponent << 4) | mantissa);
+            }
+            return encoded;
+        }
+
         private static byte[] DecodeALaw(byte[] source)
         {
             var pcm = new byte[source.Length * 2];
@@ -868,6 +1005,57 @@ namespace NSkype
             return pcm;
         }
 
+        // PCMU/PCMA (G.711) are fixed-rate codecs — 8000Hz is mandatory,
+        // not a quality tradeoff. Capturing at any other rate would
+        // desync playback pitch/speed on whichever end decodes it.
+        private void StartAudioDevices()
+        {
+            const int sampleRate = 8000;
+            var format = new NAudio.Wave.WaveFormat(sampleRate, 16, 1);
+
+            _waveIn = new NAudio.Wave.WaveInEvent { WaveFormat = format, BufferMilliseconds = 20 };
+            _waveIn.DataAvailable += WaveIn_DataAvailable;
+            _waveIn.StartRecording();
+
+            _playbackBuffer = new NAudio.Wave.BufferedWaveProvider(format) { DiscardOnBufferOverflow = true };
+            _waveOut = new NAudio.Wave.WaveOutEvent();
+            _waveOut.Init(_playbackBuffer);
+            _waveOut.Play();
+        }
+
+        private void WaveIn_DataAvailable(object sender, NAudio.Wave.WaveInEventArgs e)
+        {
+            if (_muted || _peerConnection == null || !_mediaConnected) return;
+            var data = new byte[e.BytesRecorded];
+            Buffer.BlockCopy(e.Buffer, 0, data, 0, e.BytesRecorded);
+            // Encode to mu-law and hand off to the peer connection's RTP
+            // sender. durationRtpUnits is the sample count of this frame at
+            // the 8000Hz clock G.711 uses (== encoded byte count, since
+            // mu-law is 1 byte/sample), matching what SendAudio expects.
+            var encoded = EncodeMuLaw(data);
+            try { _peerConnection.SendAudio((uint)encoded.Length, encoded); }
+            catch { /* connection likely tearing down; CleanupCall handles that */ }
+        }
+
+        // This signaling API has no separate ICE-candidate exchange endpoint —
+        // server.js's mediaContent is a single SDP blob per offer/answer, sent
+        // once. That means non-trickle ICE: we must wait for gathering to
+        // finish so all candidates are already embedded in the SDP before
+        // it's POSTed, rather than trickling them in afterward.
+        private static Task WaitForIceGatheringComplete(RTCPeerConnection pc)
+        {
+            if (pc.iceGatheringState == RTCIceGatheringState.complete) return Task.CompletedTask;
+            var tcs = new TaskCompletionSource<bool>();
+            void handler(RTCIceGatheringState state)
+            {
+                if (state != RTCIceGatheringState.complete) return;
+                pc.onicegatheringstatechange -= handler;
+                tcs.TrySetResult(true);
+            }
+            pc.onicegatheringstatechange += handler;
+            return tcs.Task;
+        }
+
         public bool SupportsVideoCalls => false; // flip once a video capture/render pipeline is added
 
         public event EventHandler<CallBottle> IncomingCallTube;
@@ -881,15 +1069,28 @@ namespace NSkype
 
             _muted = start_muted;
 
-            // No mediaContent needed — the relay doesn't use SDP at all, and
-            // your server defaults it to an empty placeholder if omitted.
+            _peerConnection = await CreatePeerConnectionAsync();
+            var offer = _peerConnection.createOffer(null);
+            await _peerConnection.setLocalDescription(offer);
+            await WaitForIceGatheringComplete(_peerConnection);
+            // localDescription's SDP reflects the full gathered set of
+            // candidates - offer.sdp above would only have whatever was
+            // gathered by the time createOffer returned, likely incomplete.
+            var offerSdp = _peerConnection.localDescription.sdp.ToString();
+
+            // The caller's offer goes in callInvitation.mediaContent - this is
+            // what callIncomingPayload() on the server surfaces to the callee
+            // as callNotification.mediaContent, and what the callee's
+            // AnswerCall applies as the remote offer.
             var resp = await PostJsonRawAsync($"/v1/users/ME/conversations/{Q(convo_id)}/calls", new
             {
-                callModalities = new[] { "Audio" }
+                callModalities = new[] { "Audio" },
+                callInvitation = new { mediaContent = new { type = "sdp", blob = offerSdp } }
             });
             if (!resp.IsSuccessStatusCode)
             {
                 DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, "Failed to start the call."));
+                CleanupCall();
                 return null;
             }
 
@@ -899,15 +1100,16 @@ namespace NSkype
             if (callId == null)
             {
                 DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, "Call was created but no call id came back."));
+                CleanupCall();
                 return null;
             }
 
-            (_relayHost, _relayPort) = ParseAudioRelay(respText);
-
             _activeCall = new ActiveCall(callId, convo_id, false, Array.Empty<User>());
-            // Audio connects once the other side actually accepts — see the
-            // CallAcceptance case in HandleEvent. Nothing more to do here;
-            // Skymu's own UI shows "ringing" as soon as this returns non-null.
+            // The remote answer arrives via the CallAcceptance event (see
+            // HandleEvent) - that's what actually gets applied to the peer
+            // connection and lets media start flowing. Nothing more to do
+            // here; Skymu's own UI shows "ringing" as soon as this returns
+            // non-null.
             return _activeCall;
         }
 
@@ -920,20 +1122,59 @@ namespace NSkype
             }
 
             var callId = _pendingIncomingCallId;
+            var offerSdp = _pendingIncomingOffer;
             _pendingIncomingCallId = null;
             _pendingIncomingConvoId = null;
+            _pendingIncomingOffer = null;
 
-            var resp = await PostJsonRawAsync($"/v1/calls/{Q(callId)}/accept", new { });
+            if (string.IsNullOrEmpty(offerSdp))
+            {
+                DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, "No offer was received for this call — can't answer it."));
+                return null;
+            }
+
+            _peerConnection = await CreatePeerConnectionAsync();
+            // Track the call from the start of answering, not after the accept
+            // POST returns. Otherwise a CallEnd arriving during ICE gathering
+            // or the POST finds no active call, cleans up, and then this
+            // method resurrects a dead call as "connected" afterwards.
+            _activeCall = new ActiveCall(callId, convo_id, false, Array.Empty<User>());
+            var setOfferResult = _peerConnection.setRemoteDescription(new RTCSessionDescriptionInit { type = RTCSdpType.offer, sdp = offerSdp });
+            if (setOfferResult != SetDescriptionResultEnum.OK)
+            {
+                DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, $"Couldn't apply the incoming call's offer: {setOfferResult}"));
+                CleanupCall();
+                return null;
+            }
+            var answer = _peerConnection.createAnswer(null);
+            await _peerConnection.setLocalDescription(answer);
+            await WaitForIceGatheringComplete(_peerConnection);
+            var answerSdp = _peerConnection.localDescription.sdp.ToString();
+
+            var resp = await PostJsonRawAsync($"/v1/calls/{Q(callId)}/accept", new
+            {
+                callAcceptance = new
+                {
+                    acceptedCallModalities = new[] { "Audio" },
+                    mediaContent = new { type = "sdp", blob = answerSdp }
+                }
+            });
             if (!resp.IsSuccessStatusCode)
             {
                 DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, "Failed to answer the call."));
+                CleanupCall();
                 return null;
             }
-            (_relayHost, _relayPort) = ParseAudioRelay(await resp.Content.ReadAsStringAsync());
 
-            _activeCall = new ActiveCall(callId, convo_id, false, Array.Empty<User>()) { State = CallState.Active };
-            await ConnectAudioSocket(callId);
-            CallStateChangedTube?.Invoke(this, new CallBottle(convo_id, CallState.Active));
+            // Don't flip to CallState.Active here - unlike the old relay
+            // (which was "connected" the instant the socket opened), real
+            // media only starts flowing once ICE/DTLS actually finish. That
+            // transition is handled by CreatePeerConnectionAsync's
+            // onconnectionstatechange handler, which fires the state-changed
+            // event itself once it genuinely happens.
+            // CleanupCall nulls _activeCall if the remote ended the call while
+            // we were answering - don't report a dead call as answered.
+            if (_activeCall == null) return null;
             return _activeCall;
         }
 
@@ -968,163 +1209,12 @@ namespace NSkype
             return Task.FromResult(false);
         }
 
-        // ---------------------------------------------------------------
-        // Audio relay: your server exposes a plain (non-TLS, to sidestep
-        // dev-cert trust issues) WebSocket endpoint per active call at
-        // ws://host:audioRelayPort/v1/calls/{id}/audio (see server.js's
-        // handleCallAudioUpgrade / audioRelayServer). Both participants
-        // connect their own socket; the server just pipes raw binary frames
-        // from one to the other verbatim, keyed by caller/callee role — no
-        // SDP, no ICE, no NAT traversal, since we already own both ends and
-        // both are already talking to the same server. This entirely
-        // replaces an earlier attempt built on SIPSorcery/WebRTC — see the
-        // "Why not WebRTC" section in README.md for why that was abandoned.
-        //
-        // The actual host/port come from the server's own response
-        // (ParseAudioRelay) rather than being guessed — see _relayHost/
-        // _relayPort above.
-        // ---------------------------------------------------------------
-
-        private async Task ConnectAudioSocket(string callId)
-        {
-            _audioCts = new CancellationTokenSource();
-            _audioSocket = new System.Net.WebSockets.ClientWebSocket();
-            _audioSocket.Options.SetRequestHeader("Authentication", $"skypetoken={_skypeToken}");
-            // ClientWebSocketOptions doesn't expose a per-instance cert callback
-            // on the net461 build (RemoteCertificateValidationCallback isn't
-            // available there) — this process-wide one is what ClientWebSocket
-            // actually respects instead. Set right before use, not eagerly in
-            // the constructor: setting it that early was interfering with the
-            // sign-in HttpClient call, which happens well before any call is
-            // ever placed.
-            System.Net.ServicePointManager.ServerCertificateValidationCallback = (sender, cert, chain, errors) => true;
-
-            var baseUri = new Uri(BaseUrl);
-            Uri relayUri;
-            if (!string.IsNullOrEmpty(_relayHost) && _relayPort > 0)
-            {
-                // Server reported an explicit separate relay address (via the
-                // audioRelay field) — some server.js builds run it on its own
-                // port. Trust that over any default.
-                relayUri = new Uri($"ws://{_relayHost}:{_relayPort}/v1/calls/{Uri.EscapeDataString(callId)}/audio");
-            }
-            else
-            {
-                // Default: this server routes the audio relay through the same
-                // listener as everything else (see server.js's server.on('upgrade')
-                // handler) rather than a separate port — so same host/port as
-                // BaseUrl, just swapping http->ws / https->wss to match whatever
-                // scheme the main listener actually speaks.
-                var scheme = baseUri.Scheme == "https" ? "wss" : "ws";
-                relayUri = new Uri($"{scheme}://{baseUri.Host}:{baseUri.Port}/v1/calls/{Uri.EscapeDataString(callId)}/audio");
-            }
-
-            try
-            {
-                await _audioSocket.ConnectAsync(relayUri, _audioCts.Token);
-            }
-            catch (Exception ex)
-            {
-                DialogTube?.Invoke(this, new DialogBottle(DialogType.Error, $"Couldn't connect the audio relay ({relayUri}): {ex.Message}"));
-                return;
-            }
-
-            StartAudioDevices();
-            _ = Task.Run(() => AudioReceiveLoop(_audioCts.Token));
-        }
-
-        // Reads an optional {audioRelay: {host, port}} field some server.js
-        // builds add to the call-creation and accept responses, for servers
-        // that run the relay on its own separate port. Returns (null, 0) if
-        // absent — which is expected/normal for a server that routes the
-        // relay through its main listener instead (ConnectAudioSocket's
-        // default path handles that case).
-        private static (string host, int port) ParseAudioRelay(string json)
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(json);
-                if (doc.RootElement.TryGetProperty("audioRelay", out var relay))
-                {
-                    var host = relay.TryGetProperty("host", out var h) ? h.GetString() : null;
-                    var port = relay.TryGetProperty("port", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
-                    return (host, port);
-                }
-            }
-            catch { /* fall through to the (null, 0) default below */ }
-            return (null, 0);
-        }
-
-        private void StartAudioDevices()
-        {
-            // Raw 16-bit mono PCM, no compression — the relay is a dumb pipe,
-            // so there's no codec negotiation to do. 16kHz is a reasonable
-            // voice-quality/bandwidth tradeoff for LAN/typical broadband; drop
-            // to 8000 here (and in the WaveFormat below) if you want lower
-            // bandwidth at the cost of quality.
-            const int sampleRate = 16000;
-            var format = new NAudio.Wave.WaveFormat(sampleRate, 16, 1);
-
-            _waveIn = new NAudio.Wave.WaveInEvent { WaveFormat = format, BufferMilliseconds = 20 };
-            _waveIn.DataAvailable += WaveIn_DataAvailable;
-            _waveIn.StartRecording();
-
-            _playbackBuffer = new NAudio.Wave.BufferedWaveProvider(format) { DiscardOnBufferOverflow = true };
-            _waveOut = new NAudio.Wave.WaveOutEvent();
-            _waveOut.Init(_playbackBuffer);
-            _waveOut.Play();
-        }
-
-        private void WaveIn_DataAvailable(object sender, NAudio.Wave.WaveInEventArgs e)
-        {
-            if (_muted || _audioSocket == null || _audioSocket.State != System.Net.WebSockets.WebSocketState.Open) return;
-            var data = new byte[e.BytesRecorded];
-            Buffer.BlockCopy(e.Buffer, 0, data, 0, e.BytesRecorded);
-            _ = SendAudioFrame(data);
-        }
-
-        private async Task SendAudioFrame(byte[] data)
-        {
-            if (_audioSocket == null || _audioSocket.State != System.Net.WebSockets.WebSocketState.Open) return;
-            // ClientWebSocket doesn't support concurrent SendAsync calls — a
-            // lock keeps mic-callback sends from overlapping each other.
-            await _audioSendLock.WaitAsync();
-            try
-            {
-                await _audioSocket.SendAsync(new ArraySegment<byte>(data),
-                    System.Net.WebSockets.WebSocketMessageType.Binary, true, CancellationToken.None);
-            }
-            catch { /* socket is likely closing; the receive loop / cleanup handles that */ }
-            finally { _audioSendLock.Release(); }
-        }
-
-        private async Task AudioReceiveLoop(CancellationToken ct)
-        {
-            var buffer = new byte[8192];
-            try
-            {
-                while (!ct.IsCancellationRequested && _audioSocket?.State == System.Net.WebSockets.WebSocketState.Open)
-                {
-                    var result = await _audioSocket.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
-                    if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close) break;
-                    if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Binary && result.Count > 0)
-                        _playbackBuffer?.AddSamples(buffer, 0, result.Count);
-                }
-            }
-            catch (OperationCanceledException) { /* expected on hangup */ }
-            catch (Exception ex)
-            {
-                DialogTube?.Invoke(this, new DialogBottle(DialogType.Warning, $"Audio relay connection lost: {ex.Message}"));
-            }
-        }
-
         private void CleanupCall()
         {
-            _audioCts?.Cancel();
-            _audioCts = null;
-            try { _audioSocket?.Abort(); } catch { /* already closed */ }
-            _audioSocket?.Dispose();
-            _audioSocket = null;
+            try { _peerConnection?.close(); } catch { /* already closed */ }
+            _peerConnection = null;
+            _mediaConnected = false;
+            _pendingIncomingOffer = null;
 
             try { _waveIn?.StopRecording(); _waveIn?.Dispose(); } catch { /* already stopped */ }
             try { _waveOut?.Stop(); _waveOut?.Dispose(); } catch { /* already stopped */ }
@@ -1134,8 +1224,6 @@ namespace NSkype
 
             _activeCall = null;
             _muted = false;
-            _relayHost = null;
-            _relayPort = 0;
         }
 
         private static string ExtractCallId(string urlOrJson)

@@ -335,7 +335,34 @@ namespace Skymu.ViewModels
                         switch (ubot.List)
                         {
                             case ListType.Contacts:
-                                ContactList.Add(ubot.Item as DirectMessage);
+                                // Unlike a brand-new contact, presence updates
+                                // (and possibly other future update sources)
+                                // fire this same event for contacts already in
+                                // the list - server.js's poll endpoint sends
+                                // presence for every contact on every single
+                                // poll cycle, not just on real changes, so an
+                                // unconditional Add() here was appending a
+                                // fresh duplicate entry per contact on every
+                                // poll. The underlying User object is already
+                                // the same shared instance from FetchContacts
+                                // (see _userCache), so its ConnectionStatus
+                                // change already raises PropertyChanged on its
+                                // own - the existing bound entry updates its
+                                // status icon by itself. This only needs to
+                                // Add when the contact is genuinely new.
+                                var incomingContact = ubot.Item as DirectMessage;
+                                if (!ContactList.Any(c => c.Identifier == incomingContact.Identifier))
+                                    ContactList.Add(incomingContact);
+
+                                // Recents (see GetConversationList) isn't a live
+                                // binding - it's a one-time-computed snapshot
+                                // that only gets recomputed when explicitly
+                                // told to via this event. Previously only new
+                                // messages fired it (UpdateRecentsListOnNewMessage),
+                                // so a contact's presence changing correctly
+                                // updated the underlying User object but Recents
+                                // never knew to redraw itself with it.
+                                CompactRecentsRefreshRequested?.Invoke(this, EventArgs.Empty);
                                 break;
                             case ListType.Conversations:
                                 ConversationList.Add(ubot.Item as Conversation);
