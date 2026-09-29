@@ -1,0 +1,285 @@
+﻿/*==========================================================*/
+// Copyright © The Skymu Team and other contributors.
+// For any inquiries or concerns, email contact@skymu.app.
+/*==========================================================*/
+// Modification or redistribution of this code is governed
+// by the terms set out in the project license agreement.
+// If you do not comply with those terms, you may not
+// modify or distribute any original code from the project.
+/*==========================================================*/
+// License: https://skymu.app/legal/license
+// SPDX-License-Identifier: AGPL-3.0-or-later
+/*==========================================================*/
+
+using Skymu.Forms;
+using Skymu.Forms.Pages;
+using Skymu.Preferences;
+using Skymu.Sounds;
+using Skymu.ViewModels;
+using Skymu.Native.Windows;
+using System;
+using System.ComponentModel;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Navigation;
+using Skymu.Helpers;
+using Yggdrasil.Models;
+using Yggdrasil.Enumerations;
+
+namespace Skymu.Skype5
+{
+    public partial class Login : Window
+    {
+        private LoginViewModel _viewModel;
+        internal bool noCloseEvent;
+        private bool switchuser = false;
+
+        public Login(bool switchuser = false)
+        {
+            this.switchuser = switchuser;
+            InitializeComponent();
+            UsernameBox.KeyUp += BoxKeyUp;
+            PasswordTokenBox.KeyUp += BoxKeyUp;
+            LoginButton.MouseLeftButtonUp += buttonLaunch;
+            this.ContentRendered += Login_ContentRendered;
+
+            _viewModel = new LoginViewModel(() => new Main());
+            _viewModel.AnimationToggleRequested += LoginToggleAnimation;
+            _viewModel.HeaderTextRequested += text => header.Text = text;
+            _viewModel.PluginSelectionUpdated += OnPluginSelectionUpdated;
+            _viewModel.MainWindowReady += OnMainWindowReady;
+
+            SoundManager.Init();
+            Tray.SetStatus(PresenceStatus.Offline);
+        }
+
+        private async void buttonLaunch(object state, RoutedEventArgs e)
+        {
+            if (ProtocolComboBox.SelectedIndex == -1) return;
+            await _viewModel.Login(
+                UsernameBox.Text,
+                PasswordTokenBox.Password
+            );
+        }
+
+        private void OnPluginSelectionUpdated(LoginViewModel.PluginListing listing)
+        {
+            Password.Foreground = new SolidColorBrush(Colors.Black);
+            PasswordTokenBox.IsEnabled = true;
+            Password.FontStyle = FontStyles.Normal;
+            Password.Text = listing.TextPassword ?? Universal.Lang["sF_USERENTRY_LABEL_PASSWORD"];
+            LoginButton.Text = Universal.Lang["sZAPBUTTON_SIGNIN"];
+
+            SkypeName.Foreground = new SolidColorBrush(Colors.Black);
+            UsernameBox.IsEnabled = true;
+            SkypeName.FontStyle = FontStyles.Normal;
+            SkypeName.Text = listing.TextUsername ?? SkypeName.Text;
+
+            if (listing.AuthenticationType != AuthenticationMethod.Password)
+            {
+                Password.Foreground = new SolidColorBrush(Colors.DarkGray);
+                PasswordTokenBox.IsEnabled = false;
+                Password.Text = "field not required";
+                Password.FontStyle = FontStyles.Italic;
+
+                switch (listing.AuthenticationType)
+                {
+                    case AuthenticationMethod.QRCode:
+                        LoginButton.Text = "Scan QR code";
+                        SkypeName.Foreground = new SolidColorBrush(Colors.DarkGray);
+                        UsernameBox.IsEnabled = false;
+                        SkypeName.FontStyle = FontStyles.Italic;
+                        SkypeName.Text = "field not required";
+                        break;
+                    case AuthenticationMethod.Passwordless:
+                        LoginButton.Text = "Send code";
+                        break;
+                    case AuthenticationMethod.External:
+                        LoginButton.Text = "External login";
+                        break;
+                    default:
+                        LoginButton.Text = Universal.Lang["sZAPBUTTON_SIGNIN"];
+                        break;
+                }
+            }
+
+            CheckEnableLoginButton();
+        }
+
+        private void OnMainWindowReady(IMainWindowHolder mainWindow)
+        {
+            _viewModel.RunPostLogin(mainWindow);
+            noCloseEvent = true;
+            Close();
+        }
+
+        private void BoxKeyUp(object sender, RoutedEventArgs e)
+        {
+            CheckEnableLoginButton();
+        }
+
+        private void CheckEnableLoginButton()
+        {
+            if (
+                (UsernameBox.Text.Trim() != string.Empty
+                    && (PasswordTokenBox.Password.Trim() != string.Empty || !PasswordTokenBox.IsEnabled))
+                || !PasswordTokenBox.IsEnabled && !UsernameBox.IsEnabled
+            )
+            {
+                LoginButton.IsEnabled = true;
+            }
+            else
+            {
+                LoginButton.IsEnabled = false;
+            }
+        }
+
+        private void OnChangeLanguage(object sender, EventArgs e) { Universal.NotImplemented(Universal.Lang["sLOGIN_CHANGE_LANGUAGE"]); }
+        private void OnConnectionOptions(object sender, EventArgs e) { new Options().Show(); }
+        private void OnAccessibility(object sender, EventArgs e) { Universal.NotImplemented(Universal.Lang["sMAINMENU_TOOLS_ACCESSIBILITY"]); }
+        private void OnHelp(object sender, EventArgs e) { Universal.OpenUrl(Universal.SKYMU_WEBSITE_HELP); }
+        private void OnCheckUpdates(object sender, EventArgs e) { new Updater(true); }
+        private void OnPrivacy(object sender, EventArgs e) { Universal.OpenUrl(Universal.SKYMU_WEBSITE_PRIVACY); }
+        private void OnAbout(object sender, EventArgs e) { new About().Show(); }
+        private void OnClose(object sender, EventArgs e) { Universal.Close(false); }
+
+        private static (string, EventHandler) MI(string label, EventHandler handler) { return (label, handler); }
+        private static (string, EventHandler) SEP() { return ("$", null); }
+
+        private void Login_Loaded(object sender, EventArgs e)
+        {
+            if (Settings.StartMinimized)
+                WindowState = WindowState.Minimized;
+
+            string L(string key) => Universal.Lang[key];
+
+            MenuBarRow.Height = new GridLength(0);
+            var menuBar = new NativeMenuBar(this);
+            menuBar.Create(
+                "&" + L("sMAINMENU_SKYPE"),
+                MI(L("sMAINMENU_SKYPE_CLOSE"), OnClose)
+            );
+            menuBar.Create(
+                "&" + L("sMAINMENU_TOOLS"),
+                MI(L("sLOGIN_CHANGE_LANGUAGE"), OnChangeLanguage),
+                SEP(),
+                MI(L("sLOGIN_CONNECTION_OPTIONS"), OnConnectionOptions),
+                SEP(),
+                MI(L("sMAINMENU_TOOLS_ACCESSIBILITY"), OnAccessibility)
+            );
+            menuBar.Create(
+                "&" + L("sMAINMENU_HELP"),
+                MI(L("sMAINMENU_HELP_HELP"), OnHelp),
+                SEP(),
+                MI(L("sMAINMENU_HELP_UPDATES"), OnCheckUpdates),
+                SEP(),
+                MI(L("sMAINMENU_HELP_PRIVACY"), OnPrivacy),
+                MI(L("sMAINMENU_HELP_ABOUT"), OnAbout)
+            );
+
+            ProtocolComboBox.DisplayMemberPath = "DisplayName";
+            ProtocolComboBox.SelectedValuePath = "DisplayName";
+            _viewModel.LoadPlugins();
+
+            foreach (var item in _viewModel.PluginItems)
+                ProtocolComboBox.Items.Add(item);
+
+            if (_viewModel.PendingAutoLogin != null && !switchuser)
+                LoginToggleAnimation(true);
+            else
+                SelectDefaultProtocol();
+
+            if (switchuser && _viewModel.PendingAutoLogin != null)
+            {
+                var pal = _viewModel.PendingAutoLoginListing;
+                var pa = _viewModel.PendingAutoLogin;
+                _viewModel.ClearPendingAutoLogin();
+                ProtocolComboBox.SelectedItem = pal;
+                ProtocolSelectionChanged(null, null);
+                SetProtocolSelection(pal, pa);
+            }
+        }
+
+        private void SelectDefaultProtocol()
+        {
+            var preferred = _viewModel.GetPreferredDefaultListing();
+            if (preferred != null)
+                ProtocolComboBox.SelectedItem = preferred;
+            else
+                ProtocolComboBox.SelectedIndex = 0;
+        }
+
+        private void SetProtocolSelection(LoginViewModel.PluginListing listing, SavedCredential creds)
+        {
+            _viewModel.HandleProtocolSelected(listing);
+            OnPluginSelectionUpdated(listing);
+            if (creds.AuthenticationType == AuthenticationMethod.QRCode) return;
+            if (creds.AuthenticationType == AuthenticationMethod.Token)
+            {
+                UsernameBox.Text = !String.IsNullOrEmpty(creds.PasswordOrToken) ? creds.PasswordOrToken : creds.User.Username;
+                CheckEnableLoginButton();
+                return;
+            }
+            UsernameBox.Text = creds.User.Username;
+            PasswordTokenBox.Password = creds.PasswordOrToken;
+            CheckEnableLoginButton();
+        }
+
+        private void ProtocolSelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            var listing = (LoginViewModel.PluginListing)ProtocolComboBox.SelectedItem;
+            foreach (var cred in _viewModel.SavedCredentials)
+            {
+                if (cred.Plugin.ToLowerInvariant() == listing.InternalName.ToLowerInvariant())
+                {
+                    SetProtocolSelection(listing, cred);
+                }
+            }
+            if (listing != null)
+                _viewModel.HandleProtocolSelected(listing);
+        }
+
+        private async void Login_ContentRendered(object sender, EventArgs e)
+        {
+            if (!switchuser)
+                await _viewModel.TryAutoLogin();
+            if (_viewModel.PendingAutoLogin != null && ProtocolComboBox.SelectedIndex == -1)
+                SelectDefaultProtocol();
+        }
+
+        private void LoginToggleAnimation(bool anim)
+        {
+            if (anim)
+            {
+                LoginControls.Visibility = Visibility.Collapsed;
+                Spinner.Visibility = Visibility.Visible;
+                header.Text = Universal.Lang["sSTATUSTEXT_PROFILE_LOGGING_IN"];
+            }
+            else
+            {
+                LoginControls.Visibility = Visibility.Visible;
+                Spinner.Visibility = Visibility.Collapsed;
+                header.Text = Universal.Lang["sF_LOGIN_WELCOME"];
+            }
+        }
+
+        private void Hyperlink_RequestNavigate(object sender, RequestNavigateEventArgs e)
+        {
+            Universal.OpenUrl(Universal.DISCORD_SERVER_INVITE);
+            e.Handled = true;
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            base.OnClosed(e);
+        }
+
+        private void Login_Closing(object sender, CancelEventArgs ev)
+        {
+            if (!noCloseEvent)
+                Universal.Hide(ev);
+        }
+    }
+}
